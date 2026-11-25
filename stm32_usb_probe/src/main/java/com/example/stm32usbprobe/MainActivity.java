@@ -342,7 +342,7 @@ public final class MainActivity extends Activity {
             return;
         }
         byte[] payload = "PING\r\n".getBytes(StandardCharsets.US_ASCII);
-        ioExecutor.execute(() -> {
+        txExecutor.execute(() -> {
             int n;
             try {
                 n = current.bulkTransfer(endpoint, payload, payload.length, 1500);
