@@ -1,0 +1,47 @@
+name: Build STM32 USB Probe APK
+
+on:
+  push:
+    branches:
+      - robot-usb-link
+    paths:
+      - 'stm32_usb_probe/**'
+      - 'gradle/**'
+      - 'settings.gradle.kts'
+      - 'build.gradle.kts'
+      - '.github/workflows/stm32-usb-probe.yml'
+  pull_request:
+    branches:
+      - robot-usb-link
+    paths:
+      - 'stm32_usb_probe/**'
+      - 'gradle/**'
+      - 'settings.gradle.kts'
+      - 'build.gradle.kts'
+      - '.github/workflows/stm32-usb-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+      - name: Build STM32 USB Probe debug APK
+        run: gradle :stm32_usb_probe:assembleDebug --no-configuration-cache
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: stm32-usb-probe-debug-apk
+          path: stm32_usb_probe/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
