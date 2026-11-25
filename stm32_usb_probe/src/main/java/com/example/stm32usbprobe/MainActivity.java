@@ -48,6 +48,7 @@ public final class MainActivity extends Activity {
     private TextView output;
     private Button sendButton;
     private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService txExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean rxRunning = new AtomicBoolean(false);
     private boolean receiverRegistered;
     private boolean controlClaimed;
@@ -138,7 +139,7 @@ public final class MainActivity extends Activity {
     private void logDevice(UsbDevice d) {
         log(String.format(Locale.US,
                 "DEVICE %04X:%04X name=%s deviceClass=%02X/%02X/%02X " +
-                "USB=%04X configs=%d interfaces=%d",
+                "USB=%s configs=%d interfaces=%d",
                 d.getVendorId(), d.getProductId(), d.getDeviceName(),
                 d.getDeviceClass(), d.getDeviceSubclass(), d.getDeviceProtocol(),
                 d.getVersion(), d.getConfigurationCount(), d.getInterfaceCount()));
@@ -419,7 +420,7 @@ public final class MainActivity extends Activity {
         if (receiverRegistered) {
             try { unregisterReceiver(permissionReceiver); } catch (Exception ignored) { }
         }
-        ioExecutor.shutdownNow();
+        ioExecutor.shutdownNow();\n        txExecutor.shutdownNow();
         super.onDestroy();
     }
 }
