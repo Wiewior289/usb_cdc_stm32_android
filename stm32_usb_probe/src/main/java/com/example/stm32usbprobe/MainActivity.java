@@ -28,6 +28,7 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Generic Android USB-host probe for an STM32 CDC-ACM or vendor-bulk device.
@@ -50,6 +51,8 @@ public final class MainActivity extends Activity {
     private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService txExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean rxRunning = new AtomicBoolean(false);
+    private final AtomicBoolean rxWorkerActive = new AtomicBoolean(false);
+    private final AtomicInteger ioGeneration = new AtomicInteger(0);
     private boolean receiverRegistered;
     private boolean controlClaimed;
     private boolean dataClaimed;
@@ -195,7 +198,8 @@ public final class MainActivity extends Activity {
                 (n > 0 ? " raw=" + hex(deviceDescriptor, Math.min(n, deviceDescriptor.length)) : ""));
         for (int index = 0; index < device.getConfigurationCount(); index++) {
             byte[] header = new byte[9];
-            int h = connection.controlTransfer(0x80, 0x06, 0x0200, index,
+            int descriptorValue = 0x0200 | index;
+            int h = connection.controlTransfer(0x80, 0x06, descriptorValue, 0,
                     header, header.length, 1000);
             if (h < 9) {
                 log("GET_DESCRIPTOR CONFIG index=" + index + " header result=" + h);
@@ -207,7 +211,7 @@ public final class MainActivity extends Activity {
                 continue;
             }
             byte[] raw = new byte[totalLength];
-            int r = connection.controlTransfer(0x80, 0x06, 0x0200, index,
+            int r = connection.controlTransfer(0x80, 0x06, descriptorValue, 0,
                     raw, raw.length, 1500);
             log("GET_DESCRIPTOR CONFIG index=" + index + " total=" + totalLength +
                     " result=" + r +
@@ -299,10 +303,13 @@ public final class MainActivity extends Activity {
     }
 
     private void startReceiver() {
-        if (bulkIn == null || connection == null || !rxRunning.compareAndSet(false, true)) return;
+        if (bulkIn == null || connection == null) return;
+        rxRunning.set(true);
+        if (!rxWorkerActive.compareAndSet(false, true)) return;
+        final int generation = ioGeneration.get();
         ioExecutor.execute(() -> {
             byte[] buffer = new byte[512];
-            while (rxRunning.get()) {
+            while (rxRunning.get() && generation == ioGeneration.get()) {
                 UsbDeviceConnection current = connection;
                 UsbEndpoint endpoint = bulkIn;
                 if (current == null || endpoint == null) break;
@@ -322,7 +329,8 @@ public final class MainActivity extends Activity {
                     log("RX bulkTransfer result=" + n);
                 }
             }
-            rxRunning.set(false);
+            rxWorkerActive.set(false);
+            if (rxRunning.get() && generation != ioGeneration.get()) startReceiver();
         });
     }
 
@@ -357,6 +365,7 @@ public final class MainActivity extends Activity {
 
     private void closeConnectionOnly() {
         rxRunning.set(false);
+        ioGeneration.incrementAndGet();
         sendButton.setEnabled(false);
         if (connection != null) {
             if (dataClaimed && dataInterface != null) {
