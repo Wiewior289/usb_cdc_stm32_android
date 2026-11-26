@@ -429,7 +429,8 @@ public final class MainActivity extends Activity {
         if (receiverRegistered) {
             try { unregisterReceiver(permissionReceiver); } catch (Exception ignored) { }
         }
-        ioExecutor.shutdownNow();\n        txExecutor.shutdownNow();
+        ioExecutor.shutdownNow();
+        txExecutor.shutdownNow();
         super.onDestroy();
     }
 }
