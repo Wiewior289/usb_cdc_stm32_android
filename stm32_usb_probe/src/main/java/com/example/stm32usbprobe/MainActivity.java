@@ -149,9 +149,9 @@ public final class MainActivity extends Activity {
 
         for (int c = 0; c < d.getConfigurationCount(); c++) {
             UsbConfiguration config = d.getConfiguration(c);
-            log(String.format(Locale.US, " CONFIG index=%d value=%d attrs=%02X maxPower=%d interfaces=%d",
-                    c, config.getId(), config.getAttributes(), config.getMaxPower(),
-                    config.getInterfaceCount()));
+            log(String.format(Locale.US, " CONFIG index=%d value=%d selfPowered=%b remoteWakeup=%b maxPower=%d interfaces=%d",
+                    c, config.getId(), config.isSelfPowered(), config.isRemoteWakeup(),
+                    config.getMaxPower(), config.getInterfaceCount()));
             for (int i = 0; i < config.getInterfaceCount(); i++) {
                 UsbInterface iface = config.getInterface(i);
                 log(String.format(Locale.US,
