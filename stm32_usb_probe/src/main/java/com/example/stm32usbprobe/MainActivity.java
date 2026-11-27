@@ -21,8 +21,9 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
@@ -48,11 +49,24 @@ public final class MainActivity extends Activity {
     private UsbEndpoint bulkOut;
     private TextView output;
     private Button sendButton;
+    private Button benchmarkButton;
     private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService txExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean rxRunning = new AtomicBoolean(false);
     private final AtomicBoolean rxWorkerActive = new AtomicBoolean(false);
     private final AtomicInteger ioGeneration = new AtomicInteger(0);
+    private final AtomicBoolean transactionRunning = new AtomicBoolean(false);
+    private final Object pendingLock = new Object();
+    private final CzarProtocol.StreamDecoder czarDecoder = new CzarProtocol.StreamDecoder();
+    private final SecureRandom secureRandom = new SecureRandom();
+    private final int sessionId = secureRandom.nextInt();
+    private int nextSequence;
+    private boolean pendingActive;
+    private boolean pendingAborted;
+    private int pendingSessionId;
+    private int pendingSequence;
+    private CzarProtocol.Response pendingResponse;
+    private long pendingResponseRxNs;
     private boolean receiverRegistered;
     private boolean controlClaimed;
     private boolean dataClaimed;
@@ -77,8 +91,10 @@ public final class MainActivity extends Activity {
 
         addButton(root, "1. SCAN USB + DESCRIPTORS", v -> scanDevices());
         addButton(root, "2. CLOSE / RELEASE", v -> closeDevice());
-        sendButton = addButton(root, "3. SEND PING (CDC/BULK ECHO)", v -> sendPing());
+        sendButton = addButton(root, "3. SEND CZAR V1 (64 B)", v -> sendCzarSingle());
+        benchmarkButton = addButton(root, "4. CZAR V1 BENCHMARK SWEEP", v -> runCzarBenchmark());
         sendButton.setEnabled(false);
+        benchmarkButton.setEnabled(false);
 
         output = new TextView(this);
         output.setTextSize(12);
@@ -97,9 +113,11 @@ public final class MainActivity extends Activity {
         }
         receiverRegistered = true;
 
-        log("STM32 USB Probe 0.1");
+        log("STM32 USB Probe 0.2 - CZAR V1");
         log("Generic USB Host discovery. No VID/PID allowlist.");
-        log("Expected next step: STM32 CDC-ACM firmware with bulk IN/OUT echo.");
+        log(String.format(Locale.US, "CZAR session=%08X; stop-and-wait; max payload=%d B",
+                sessionId, CzarProtocol.MAX_PAYLOAD_LENGTH));
+        log("Expected peer: STM32 CDC-ACM firmware implementing CZAR V1.");
         scanDevices();
     }
 
@@ -288,6 +306,7 @@ public final class MainActivity extends Activity {
                 bulkIn.getAddress(), bulkIn.getMaxPacketSize(),
                 bulkOut.getAddress(), bulkOut.getMaxPacketSize()));
         sendButton.setEnabled(true);
+        benchmarkButton.setEnabled(true);
         startReceiver();
     }
 
@@ -321,10 +340,30 @@ public final class MainActivity extends Activity {
                     break;
                 }
                 if (n > 0) {
+                    long rxChunkCompleteNs = System.nanoTime();
                     byte[] packet = new byte[n];
                     System.arraycopy(buffer, 0, packet, 0, n);
-                    log("RX n=" + n + " hex=" + hex(packet, n) +
-                            " ascii=" + printable(packet));
+                    long crcErrorsBefore = czarDecoder.getCrcErrorCount();
+                    long invalidLengthsBefore = czarDecoder.getInvalidLengthCount();
+                    long decoderOverflowsBefore = czarDecoder.getBufferOverflowCount();
+                    List<CzarProtocol.Response> responses =
+                            czarDecoder.feed(packet, 0, packet.length);
+                    long crcErrors = czarDecoder.getCrcErrorCount() - crcErrorsBefore;
+                    long invalidLengths =
+                            czarDecoder.getInvalidLengthCount() - invalidLengthsBefore;
+                    long decoderOverflows =
+                            czarDecoder.getBufferOverflowCount() - decoderOverflowsBefore;
+                    log("USB RX chunk bytes=" + n);
+                    if (crcErrors > 0) {
+                        log("CZAR RX discarded invalid-CRC candidate(s)=" + crcErrors);
+                    }
+                    if (invalidLengths > 0) {
+                        log("CZAR RX rejected oversized PAYLOAD_LEN candidate(s)=" + invalidLengths);
+                    }
+                    if (decoderOverflows > 0) {
+                        log("CZAR RX decoder discontinuity/overflow events=" + decoderOverflows);
+                    }
+                    handleCzarResponses(responses, rxChunkCompleteNs);
                 } else if (n < 0 && rxRunning.get()) {
                     log("RX bulkTransfer result=" + n);
                 }
@@ -334,31 +373,267 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private void sendPing() {
+    private static final int CZAR_RESPONSE_TIMEOUT_MS = 2500;
+    private static final int CZAR_TX_TIMEOUT_MS = 2500;
+    private static final int BENCHMARK_ITERATIONS = 5;
+    private static final int[] BENCHMARK_PAYLOAD_SIZES =
+            {1, 16, 32, 63, 64, 65, 128, 256, 512, 1024, 2048};
+
+    private void sendCzarSingle() {
+        if (!transactionRunning.compareAndSet(false, true)) return;
+        setTransactionButtonsEnabled(false);
+        txExecutor.execute(() -> {
+            TransactionResult result = executeCzarTransaction(64);
+            if (result == null) {
+                log("CZAR transaction could not start: USB bulk transport is not ready.");
+            } else {
+                logTransactionResult("CZAR SINGLE", result);
+            }
+            transactionRunning.set(false);
+            setTransactionButtonsEnabled(connection != null && bulkOut != null && bulkIn != null);
+        });
+    }
+
+    private void runCzarBenchmark() {
+        if (!transactionRunning.compareAndSet(false, true)) return;
+        setTransactionButtonsEnabled(false);
+        txExecutor.execute(() -> {
+            log("CZAR BENCHMARK BEGIN iterations=" + BENCHMARK_ITERATIONS
+                    + " sizes=" + Arrays.toString(BENCHMARK_PAYLOAD_SIZES));
+            log("CSV payload_len,samples,min_rtt_us,avg_rtt_us,median_rtt_us,p95_rtt_us,"
+                    + "p99_rtt_us,max_rtt_us,stddev_rtt_us,stm32_proc_avg_us,fps");
+            boolean aborted = false;
+            for (int payloadLength : BENCHMARK_PAYLOAD_SIZES) {
+                List<Long> rttSamples = new ArrayList<>();
+                List<Long> processingSamples = new ArrayList<>();
+                long groupStartNs = System.nanoTime();
+                for (int iteration = 0; iteration < BENCHMARK_ITERATIONS; iteration++) {
+                    TransactionResult result = executeCzarTransaction(payloadLength);
+                    if (result == null || !result.received || !result.valid
+                            || result.response == null
+                            || result.response.status != CzarProtocol.STATUS_OK) {
+                        logTransactionResult("BENCH FAIL len=" + payloadLength
+                                + " iteration=" + (iteration + 1), result);
+                        aborted = true;
+                        break;
+                    }
+                    rttSamples.add(result.rttNs);
+                    processingSamples.add(result.processingUs);
+                }
+                long groupElapsedNs = System.nanoTime() - groupStartNs;
+                if (!rttSamples.isEmpty()) {
+                    logBenchmarkRow(payloadLength, rttSamples, processingSamples, groupElapsedNs);
+                }
+                if (aborted) break;
+            }
+            log("CZAR BENCHMARK " + (aborted ? "ABORTED" : "COMPLETE"));
+            transactionRunning.set(false);
+            setTransactionButtonsEnabled(connection != null && bulkOut != null && bulkIn != null);
+        });
+    }
+
+    private TransactionResult executeCzarTransaction(int payloadLength) {
         UsbDeviceConnection current = connection;
         UsbEndpoint endpoint = bulkOut;
-        if (current == null || endpoint == null) {
-            log("TX blocked: bulk transport is not ready.");
+        if (current == null || endpoint == null || bulkIn == null) return null;
+
+        final int sequence = nextSequence++;
+        final byte[] payload;
+        try {
+            payload = CzarProtocol.createPayload(sessionId, sequence, payloadLength);
+        } catch (IllegalArgumentException error) {
+            return TransactionResult.failure("Payload error: " + error.getMessage());
+        }
+
+        final long androidTxNs = System.nanoTime();
+        final byte[] request = CzarProtocol.encodeRequest(
+                sessionId, sequence, androidTxNs, payload);
+        synchronized (pendingLock) {
+            if (pendingActive) return TransactionResult.failure("Another CZAR request is pending");
+            pendingActive = true;
+            pendingAborted = false;
+            pendingSessionId = sessionId;
+            pendingSequence = sequence;
+            pendingResponse = null;
+            pendingResponseRxNs = 0L;
+        }
+
+        try {
+            int sent = current.bulkTransfer(endpoint, request, request.length, CZAR_TX_TIMEOUT_MS);
+            if (sent != request.length) {
+                return TransactionResult.failure("USB TX incomplete: " + sent
+                        + "/" + request.length + " bytes");
+            }
+
+            CzarProtocol.Response response;
+            long androidRxNs;
+            long deadlineNs = System.nanoTime()
+                    + CZAR_RESPONSE_TIMEOUT_MS * 1_000_000L;
+            synchronized (pendingLock) {
+                while (pendingResponse == null && !pendingAborted) {
+                    long remainingNs = deadlineNs - System.nanoTime();
+                    if (remainingNs <= 0L) break;
+                    long waitMs = remainingNs / 1_000_000L;
+                    int waitNs = (int) (remainingNs % 1_000_000L);
+                    pendingLock.wait(waitMs, waitNs);
+                }
+                if (pendingAborted) {
+                    return TransactionResult.failure("USB connection closed while waiting");
+                }
+                if (pendingResponse == null) {
+                    return TransactionResult.timeout("No matching CZAR response within "
+                            + CZAR_RESPONSE_TIMEOUT_MS + " ms");
+                }
+                response = pendingResponse;
+                androidRxNs = pendingResponseRxNs;
+            }
+
+            long rttNs = androidRxNs - androidTxNs;
+            String validation = CzarProtocol.validateResponse(
+                    response, sessionId, sequence, payload);
+            long processingUs = CzarProtocol.stm32ProcessingTimeUs(response);
+            return new TransactionResult(true, validation == null, response,
+                    rttNs, processingUs, validation);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            return TransactionResult.failure("Interrupted while waiting for CZAR response");
+        } catch (RuntimeException error) {
+            return TransactionResult.failure("USB TX/RX exception: " + error);
+        } finally {
+            synchronized (pendingLock) {
+                pendingActive = false;
+                pendingResponse = null;
+                pendingLock.notifyAll();
+            }
+        }
+    }
+
+    private void handleCzarResponses(
+            List<CzarProtocol.Response> responses, long rxTimestampNs) {
+        for (CzarProtocol.Response response : responses) {
+            boolean matched = false;
+            synchronized (pendingLock) {
+                if (pendingActive
+                        && response.sessionId == pendingSessionId
+                        && response.sequence == pendingSequence
+                        && pendingResponse == null) {
+                    pendingResponse = response;
+                    pendingResponseRxNs = rxTimestampNs;
+                    pendingLock.notifyAll();
+                    matched = true;
+                }
+            }
+            if (matched) {
+                log(String.format(Locale.US,
+                        "CZAR RX matched session=%08X seq=%s status=%s payload=%d",
+                        response.sessionId, Integer.toUnsignedString(response.sequence),
+                        CzarProtocol.statusName(response.status), response.payloadLength()));
+            } else {
+                log(String.format(Locale.US,
+                        "CZAR RX unmatched session=%08X seq=%s type=%02X version=%02X",
+                        response.sessionId, Integer.toUnsignedString(response.sequence),
+                        response.type, response.version));
+            }
+        }
+    }
+
+    private void logTransactionResult(String label, TransactionResult result) {
+        if (result == null) {
+            log(label + ": no result");
             return;
         }
-        byte[] payload = "PING\r\n".getBytes(StandardCharsets.US_ASCII);
-        txExecutor.execute(() -> {
-            int n;
-            try {
-                n = current.bulkTransfer(endpoint, payload, payload.length, 1500);
-            } catch (RuntimeException error) {
-                log("TX exception: " + error);
-                return;
-            }
-            log("TX PING bytes=" + payload.length + " result=" + n +
-                    " endpoint=0x" + String.format(Locale.US, "%02X", endpoint.getAddress()));
-            log("Expected echo response: PONG or echoed PING. TX completion alone is not peer acknowledgement.");
+        if (!result.received) {
+            log(label + ": " + result.error);
+            return;
+        }
+        CzarProtocol.Response response = result.response;
+        log(String.format(Locale.US,
+                "%s: %s status=%s RTT=%.3f ms STM32_processing=%d us",
+                label, result.valid ? "VALID" : "INVALID",
+                CzarProtocol.statusName(response.status),
+                result.rttNs / 1_000_000.0, result.processingUs));
+        if (result.error != null) log(label + ": " + result.error);
+    }
+
+    private void logBenchmarkRow(int payloadLength, List<Long> rttNs,
+                                 List<Long> processingUs, long elapsedNs) {
+        long[] rtt = toSortedArray(rttNs);
+        long[] processing = toSortedArray(processingUs);
+        double sum = 0.0;
+        for (long sample : rtt) sum += sample;
+        double mean = sum / rtt.length;
+        double variance = 0.0;
+        for (long sample : rtt) {
+            double delta = sample - mean;
+            variance += delta * delta;
+        }
+        double stddev = Math.sqrt(variance / rtt.length);
+        double processingMean = 0.0;
+        for (long sample : processing) processingMean += sample;
+        processingMean /= processing.length;
+        double fps = elapsedNs > 0
+                ? rtt.length * 1_000_000_000.0 / elapsedNs : 0.0;
+
+        log(String.format(Locale.US,
+                "%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f",
+                payloadLength, rtt.length,
+                rtt[0] / 1000.0, mean / 1000.0,
+                percentile(rtt, 0.50) / 1000.0,
+                percentile(rtt, 0.95) / 1000.0,
+                percentile(rtt, 0.99) / 1000.0,
+                rtt[rtt.length - 1] / 1000.0,
+                stddev / 1000.0, processingMean, fps));
+    }
+
+    private long[] toSortedArray(List<Long> values) {
+        long[] result = new long[values.size()];
+        for (int i = 0; i < values.size(); i++) result[i] = values.get(i);
+        Arrays.sort(result);
+        return result;
+    }
+
+    private long percentile(long[] sorted, double percentile) {
+        int index = (int) Math.ceil(percentile * sorted.length) - 1;
+        return sorted[Math.max(0, Math.min(sorted.length - 1, index))];
+    }
+
+    private void setTransactionButtonsEnabled(boolean enabled) {
+        runOnUiThread(() -> {
+            if (sendButton != null) sendButton.setEnabled(enabled);
+            if (benchmarkButton != null) benchmarkButton.setEnabled(enabled);
         });
+    }
+
+    private static final class TransactionResult {
+        final boolean received;
+        final boolean valid;
+        final CzarProtocol.Response response;
+        final long rttNs;
+        final long processingUs;
+        final String error;
+
+        TransactionResult(boolean received, boolean valid, CzarProtocol.Response response,
+                          long rttNs, long processingUs, String error) {
+            this.received = received;
+            this.valid = valid;
+            this.response = response;
+            this.rttNs = rttNs;
+            this.processingUs = processingUs;
+            this.error = error;
+        }
+
+        static TransactionResult failure(String message) {
+            return new TransactionResult(false, false, null, 0L, 0L, message);
+        }
+
+        static TransactionResult timeout(String message) {
+            return failure(message);
+        }
     }
 
     private void closeDevice() {
         rxRunning.set(false);
-        sendButton.setEnabled(false);
+        setTransactionButtonsEnabled(false);
         closeConnectionOnly();
         device = null;
     }
@@ -366,7 +641,12 @@ public final class MainActivity extends Activity {
     private void closeConnectionOnly() {
         rxRunning.set(false);
         ioGeneration.incrementAndGet();
-        sendButton.setEnabled(false);
+        setTransactionButtonsEnabled(false);
+        czarDecoder.reset();
+        synchronized (pendingLock) {
+            pendingAborted = true;
+            pendingLock.notifyAll();
+        }
         if (connection != null) {
             if (dataClaimed && dataInterface != null) {
                 try { log("RELEASE data -> " + connection.releaseInterface(dataInterface)); }

@@ -36,6 +36,8 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
+      - name: Run CZAR protocol unit tests
+        run: gradle :stm32_usb_probe:testDebugUnitTest --no-configuration-cache
       - name: Build STM32 USB Probe debug APK
         run: gradle :stm32_usb_probe:assembleDebug --no-configuration-cache
       - name: Upload APK
