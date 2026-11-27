@@ -37,6 +37,8 @@ public class CzarProtocolTest {
         assertArrayEquals(new byte[] {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
                 Arrays.copyOfRange(frame, 16, 24));
         assertArrayEquals(payload, Arrays.copyOfRange(frame, 24, 26));
+        assertArrayEquals(hex("43 5A 41 52 01 01 12 34 56 78 09 0A 0B 0C "
+                + "02 00 01 02 03 04 05 06 07 08 29 3A B9 9E B1 38"), frame);
         assertEquals(CzarProtocol.crc32(frame, 4, 22), readU32(frame, 26));
     }
 
@@ -44,6 +46,20 @@ public class CzarProtocolTest {
     public void payloadUsesModulo256Formula() {
         byte[] payload = CzarProtocol.createPayload(250, 3, 4);
         assertArrayEquals(new byte[] {(byte) 87, (byte) 104, (byte) 121, (byte) 138}, payload);
+    }
+
+    @Test
+    public void responseMatchesSharedGoldenVector() {
+        byte[] frame = hex("43 5A 41 52 01 02 12 34 56 78 09 0A 0B 0C "
+                + "02 00 44 33 22 11 99 33 22 11 00 29 3A 07 DA 90 10");
+        CzarProtocol.Response response = decode(frame);
+        assertEquals(0x78563412, response.sessionId);
+        assertEquals(0x0C0B0A09, response.sequence);
+        assertEquals(0x11223344, response.stm32RxUs);
+        assertEquals(0x11223399, response.stm32TxUs);
+        assertEquals(CzarProtocol.STATUS_OK, response.status);
+        assertArrayEquals(new byte[] {0x29, 0x3A}, response.payload);
+        assertEquals(0x55L, CzarProtocol.stm32ProcessingTimeUs(response));
     }
 
     @Test
@@ -138,6 +154,15 @@ public class CzarProtocolTest {
                 () -> CzarProtocol.createPayload(1, 1, 2049));
         assertEquals(2076, CzarProtocol.encodeRequest(1, 2, 3,
                 new byte[2048]).length);
+    }
+
+    private static byte[] hex(String value) {
+        String[] parts = value.trim().split("\\s+");
+        byte[] bytes = new byte[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            bytes[i] = (byte) Integer.parseInt(parts[i], 16);
+        }
+        return bytes;
     }
 
     private static CzarProtocol.Response decode(byte[] frame) {

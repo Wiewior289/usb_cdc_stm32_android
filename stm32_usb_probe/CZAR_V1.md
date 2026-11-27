@@ -58,6 +58,35 @@ The ASCII bytes `31 32 33 34 35 36 37 38 39` (`123456789`) produce CRC-32/ISO-HD
 
 Both implementations should retain this as a common first-level test vector.
 
+## Shared frame vectors
+
+The following fixed values are used by both Android and STM32 tests:
+
+- SESSION_ID: `0x78563412`
+- SEQUENCE: `0x0C0B0A09`
+- PAYLOAD_LEN: `2`
+- ANDROID_TX_NS: `0x0807060504030201`
+- Payload: `29 3A` (matches the modulo-256 payload formula)
+- Response STM32_RX_US: `0x11223344`
+- Response STM32_TX_US: `0x11223399`
+- Response STATUS: `0x00`
+
+Request frame, including CRC:
+
+```
+43 5A 41 52 01 01 12 34 56 78 09 0A 0B 0C
+02 00 01 02 03 04 05 06 07 08 29 3A B9 9E B1 38
+```
+
+Response frame, including CRC:
+
+```
+43 5A 41 52 01 02 12 34 56 78 09 0A 0B 0C
+02 00 44 33 22 11 99 33 22 11 00 29 3A 07 DA 90 10
+```
+
+These frame vectors verify offsets, endian handling and CRC coverage in addition to the standalone CRC check vector.
+
 ## Session, sequence and payload
 
 - Android generates a random 32-bit SESSION_ID for the app session.
