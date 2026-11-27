@@ -315,7 +315,7 @@ public final class CzarProtocol {
         out[offset + 1] = (byte) (value >>> 8);
     }
 
-    private static void putU32Le(byte[] out, int offset, int value) {
+    private static void putU32Le(byte[] out, int offset, long value) {
         for (int i = 0; i < 4; i++) out[offset + i] = (byte) (value >>> (8 * i));
     }
 
