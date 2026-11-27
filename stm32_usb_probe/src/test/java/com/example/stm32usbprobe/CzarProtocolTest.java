@@ -20,7 +20,7 @@ public class CzarProtocolTest {
         int session = 0x78563412;
         int sequence = 0x0C0B0A09;
         long timestamp = 0x0807060504030201L;
-        byte[] payload = new byte[] {0x55, (byte) 0xAA};
+        byte[] payload = new byte[] {0x29, 0x3A};
         byte[] frame = CzarProtocol.encodeRequest(session, sequence, timestamp, payload);
 
         assertEquals(30, frame.length);
